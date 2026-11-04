@@ -45,6 +45,14 @@ enum PromptCacheReuseDecision: Equatable {
     /// target-only from the common prefix.
     case trimToCommonPrefixMainOnly(commonPrefixLength: Int, trimCount: Int)
 
+    /// The rewind is longer than the cache retains, but its prompt checkpoint
+    /// lies within the common prefix. Restore the checkpoint, then feed
+    /// `promptTokens[tokenCount...]`.
+    ///
+    /// Like ``trimToCommonPrefix``, this can fail while being applied, and is
+    /// then downgraded to ``rebuild``.
+    case restoreCheckpoint(tokenCount: Int)
+
     /// The cache cannot be reconciled with this prompt. Discard it, drop any
     /// carried model state, and feed the whole prompt.
     case rebuild
@@ -53,7 +61,7 @@ enum PromptCacheReuseDecision: Equatable {
     var reusesCachedPrefix: Bool {
         switch self {
         case .appendSuffix, .appendSuffixToMain, .appendMediaSuffix, .trimToCommonPrefix,
-            .trimToCommonPrefixMainOnly:
+            .trimToCommonPrefixMainOnly, .restoreCheckpoint:
             return true
         case .prefillAll, .rebuild:
             return false
@@ -162,6 +170,11 @@ struct PromptCacheState: Sendable {
 
     /// Exact rewind limit across all participating layers.
     var maxTrimCount: Int = 0
+
+    /// Position of the main cache's prompt checkpoint, which it can return to
+    /// however far that is. The first `checkpointTokenCount` tokens of
+    /// `cachedTokens` are what the checkpoint holds.
+    var checkpointTokenCount: Int? = nil
 }
 
 /// One reusability rule.
@@ -295,22 +308,35 @@ struct RewindToCommonPrefixRule: PromptCacheReuseRule {
             turn.promptTokens.count - 1)
         let trimCount = cache.cachedTokens.count - commonPrefixLength
 
-        let canRewind =
+        let canRewindSafely =
             commonPrefixLength > 0
             && commonPrefixLength < turn.promptTokens.count
             && trimCount > 0
             && cache.mainCacheIsAligned
-            && trimCount <= cache.maxTrimCount
             && !turn.carriesNewMedia
             && !turn.carriesPreparedMedia
             && !turn.carriesAttentionMask
             && !turn.carriesModelState
 
-        guard canRewind else {
+        guard canRewindSafely else {
             // The template changed an already-cached portion of the transcript,
             // or this input carries state/media that cannot be rewound safely.
             // Rebuild rather than combining a mismatched prompt with stale
             // model state.
+            return .rebuild
+        }
+
+        if trimCount > cache.maxTrimCount {
+            // Too far for the cache to rewind -- typically over a response the
+            // template no longer renders. Its checkpoint returns the main cache to
+            // the end of that turn's prompt. Speculative state has no checkpoint,
+            // so a speculating turn rebuilds instead.
+            if let checkpoint = cache.checkpointTokenCount,
+                checkpoint > 0, checkpoint <= commonPrefixLength,
+                !turn.usesSpeculativeDecoding
+            {
+                return .restoreCheckpoint(tokenCount: checkpoint)
+            }
             return .rebuild
         }
 

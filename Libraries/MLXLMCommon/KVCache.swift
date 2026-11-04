@@ -1119,6 +1119,29 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
         return new
     }
 
+    /// An independent copy of only the rows later attention reads: the pinned prefix and the
+    /// newest window, in temporal order.
+    ///
+    /// A ``copy()`` shares this cache's buffer, so the next write into either duplicates all of
+    /// it, rewind reserve included. This copies the window into buffers of its own. The snapshot
+    /// keeps the logical offset and extends exactly as this cache would, but it holds no history
+    /// beyond the window, so it cannot rewind until later writes refill its reserve.
+    package func windowSnapshot() -> RotatingKVCache {
+        let snapshot = RotatingKVCache(
+            maxSize: maxCacheSize, keep: keep, step: step, rewindCapacity: rewindCapacity)
+        snapshot.capacityOrigin = capacityOrigin
+        snapshot.offset = offset
+        if let (keys, values) = retainedView(tail: maxCacheSize) {
+            let ownedKeys = contiguous(keys)
+            let ownedValues = contiguous(values)
+            eval(ownedKeys, ownedValues)
+            snapshot.keys = ownedKeys
+            snapshot.values = ownedValues
+            snapshot.idx = ownedKeys.dim(2)
+        }
+        return snapshot
+    }
+
     /// Convert to a quantized cache.
     ///
     /// Rotating-cache quantization needs a representation that preserves temporal ordering and

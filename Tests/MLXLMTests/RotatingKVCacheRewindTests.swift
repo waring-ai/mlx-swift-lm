@@ -289,6 +289,83 @@ final class RotatingKVCacheRewindTests: XCTestCase {
         }
     }
 
+    func testPromptCheckpointRestoresPastTheReserveAndMatchesColdPrefix() throws {
+        let json = """
+            {"model_type":"gpt_oss","num_hidden_layers":2,"num_local_experts":4,
+             "num_experts_per_tok":2,"vocab_size":32,"rms_norm_eps":1e-6,
+             "hidden_size":16,"intermediate_size":16,"head_dim":8,
+             "num_attention_heads":2,"num_key_value_heads":1,"sliding_window":8,
+             "rope_theta":10000.0,"layer_types":["sliding_attention","full_attention"]}
+            """
+        let config = try JSONDecoder().decode(GPTOSSConfiguration.self, from: Data(json.utf8))
+        let model = withRandomState(MLXRandom.RandomState(seed: 618)) { GPTOSSModel(config) }
+        let parameters = GenerateParameters(
+            kvCache: KVCacheConfiguration(rewind: try .init(maxTokens: 4)))
+        let storage = KVCacheStorage(try model.newCache(parameters: parameters), plan: .disabled)
+        let reference = try model.newCache(parameters: nil)
+
+        // A prompt longer than the window, so the sliding layer has already evicted rows.
+        let prompt = MLXArray(Array(0 ..< 12)).reshaped(1, 12)
+        eval(model(prompt, cache: storage.cache))
+        storage.commitProcessedTokens(12)
+        eval(model(prompt, cache: reference))
+        storage.capturePromptCheckpoint()
+        let checkpoint = try XCTUnwrap(storage.promptCheckpoint)
+        XCTAssertEqual(checkpoint.processedTokenCount, 12)
+        // Only the window is kept, not the reserve.
+        XCTAssertEqual(checkpoint.memoryBytes, 2 * 8 * 8 * 4)
+
+        for pass in 0 ..< 2 {
+            // A response far longer than the reserve.
+            for position in 0 ..< 20 {
+                eval(model(MLXArray([20 + position]).reshaped(1, 1), cache: storage.cache))
+                storage.commitProcessedTokens(1)
+            }
+            XCTAssertLessThan(storage.cache.map(\.maxTrimCount).min() ?? 0, 20)
+            XCTAssertTrue(storage.restorePromptCheckpoint(), "pass \(pass)")
+            XCTAssertEqual(storage.processedTokenCount, 12)
+            XCTAssertEqual(storage.cache.map(\.offset), [12, 12])
+
+            // The restored cache continues exactly as one that never left the prompt.
+            let cold = reference.map { $0.copy() }
+            for tokens in [[24], [25, 26, 27], [28]] {
+                let input = MLXArray(tokens).reshaped(1, tokens.count)
+                let actual = model(input, cache: storage.cache)
+                storage.commitProcessedTokens(tokens.count)
+                let expected = model(input, cache: cold)
+                XCTAssertTrue(
+                    allClose(actual, expected, rtol: 1e-4, atol: 1e-5).item(Bool.self),
+                    "pass \(pass), tokens \(tokens)")
+            }
+            // Writes into the restored entries leave the checkpoint intact.
+            XCTAssertEqual(storage.promptCheckpoint?.processedTokenCount, 12)
+        }
+    }
+
+    func testPromptCheckpointIsDroppedOnceTheTimelineFallsBelowIt() {
+        let storage = KVCacheStorage(
+            [KVCacheSimple(), RotatingKVCache(maxSize: 8, rewindCapacity: 4)], plan: .disabled)
+        fill(storage.cache, positions: 0 ..< 12)
+        storage.commitProcessedTokens(12)
+        storage.capturePromptCheckpoint()
+        fill(storage.cache, positions: 12 ..< 14)
+        storage.commitProcessedTokens(2)
+
+        XCTAssertEqual(storage.trim(2), 2)
+        XCTAssertNotNil(storage.promptCheckpoint)
+        XCTAssertEqual(storage.trim(1), 1)
+        XCTAssertNil(storage.promptCheckpoint)
+        XCTAssertFalse(storage.restorePromptCheckpoint())
+    }
+
+    func testPromptCheckpointIsOnlyKeptForSlidingWindowCaches() {
+        let storage = KVCacheStorage([KVCacheSimple(), KVCacheSimple()], plan: .disabled)
+        fill(storage.cache, positions: 0 ..< 12)
+        storage.commitProcessedTokens(12)
+        storage.capturePromptCheckpoint()
+        XCTAssertNil(storage.promptCheckpoint)
+    }
+
     func testRewindConfigurationRejectsInvalidAndUnrealizedReserves() throws {
         for count in [-1, 0] {
             XCTAssertThrowsError(try KVCacheConfiguration.Rewind(maxTokens: count))

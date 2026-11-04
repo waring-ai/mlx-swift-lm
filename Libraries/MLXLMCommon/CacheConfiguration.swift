@@ -160,6 +160,11 @@ public struct KVCacheStatus: Sendable, Hashable {
         layers.reduce(0) { $0 + $1.memoryBytes }
     }
 
+    /// Bytes held by the session's prompt checkpoint, beyond ``memoryBytes``: the
+    /// sliding-window rows kept so a later turn can return to the end of the last
+    /// prompt.
+    public internal(set) var promptCheckpointMemoryBytes = 0
+
     /// Inspect a raw cache array using a typed request.
     public init(
         cache: [KVCache],

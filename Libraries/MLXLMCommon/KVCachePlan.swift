@@ -154,7 +154,33 @@ package final class KVCacheStorage {
     /// Individual cache entries retain their native offsets and metadata, but
     /// the model-wide timeline lives here exactly once. Generation updates this
     /// value after successful model calls and rolls it back with cache trims.
-    package private(set) var processedTokenCount: Int
+    package private(set) var processedTokenCount: Int {
+        didSet {
+            // Positions below the checkpoint may be rewritten once the timeline
+            // falls under it, so it no longer describes what the cache held.
+            if let promptCheckpoint, processedTokenCount < promptCheckpoint.processedTokenCount {
+                self.promptCheckpoint = nil
+            }
+        }
+    }
+
+    /// The cache as it stood at the end of a prompt, for rewinding further than its
+    /// entries retain.
+    ///
+    /// A sliding-window entry can rewind only as far as its rewind reserve, and a
+    /// response usually generates more than that. Restoring its window from the end
+    /// of the prompt instead returns the whole cache there exactly, so the next turn
+    /// prefills only what follows the prompt.
+    package struct PromptCheckpoint {
+        package let processedTokenCount: Int
+        /// The window snapshot to restore for each sliding-window entry; `nil`
+        /// entries rewind by trimming.
+        fileprivate let windows: [RotatingKVCache?]
+        package let memoryBytes: Int
+    }
+
+    /// Valid while the timeline has not fallen below it.
+    package private(set) var promptCheckpoint: PromptCheckpoint?
 
     package init(
         _ cache: [KVCache],
@@ -193,6 +219,64 @@ package final class KVCacheStorage {
         processedTokenCount -= trimmed
         lastRound = nil
         return trimmed
+    }
+
+    /// Record the current position as a ``PromptCheckpoint``, replacing any earlier one.
+    ///
+    /// Only sliding-window entries are snapshotted; every other entry must be trimmable,
+    /// and is trimmed back when the checkpoint is restored. Without a sliding-window
+    /// entry a trim already reaches any position, so no checkpoint is kept.
+    package func capturePromptCheckpoint() {
+        precondition(!roundIsOpen, "cannot checkpoint while a staged round is open")
+        promptCheckpoint = nil
+        guard processedTokenCount > 0,
+            cache.contains(where: { $0 is RotatingKVCache }),
+            cache.allSatisfy({ $0 is RotatingKVCache || ($0.isTrimmable && !($0 is CacheList)) })
+        else { return }
+
+        let windows = cache.map { ($0 as? RotatingKVCache)?.windowSnapshot() }
+        let memoryBytes = windows.compactMap { $0 }
+            .flatMap { $0.innerState() }
+            .reduce(0) { $0 + $1.nbytes }
+        promptCheckpoint = PromptCheckpoint(
+            processedTokenCount: processedTokenCount, windows: windows,
+            memoryBytes: memoryBytes)
+    }
+
+    /// Return the cache to its ``promptCheckpoint``.
+    ///
+    /// Every entry is checked before any is changed. Returns `false` when there is no
+    /// checkpoint or an entry cannot reach it; the caller then rebuilds the cache.
+    package func restorePromptCheckpoint() -> Bool {
+        precondition(!roundIsOpen, "cannot restore while a staged round is open")
+        guard let checkpoint = promptCheckpoint,
+            checkpoint.windows.count == cache.count
+        else { return false }
+        let rewind = processedTokenCount - checkpoint.processedTokenCount
+        guard rewind >= 0 else { return false }
+        let reachable = zip(cache, checkpoint.windows).allSatisfy { entry, window in
+            window != nil
+                ? entry is RotatingKVCache
+                : entry.isTrimmable && entry.maxTrimCount >= rewind
+        }
+        guard reachable else { return false }
+
+        var restored = cache
+        for (index, window) in checkpoint.windows.enumerated() {
+            if let window {
+                // A copy, so the checkpoint survives writes into the restored entry.
+                restored[index] = window.copy()
+            } else if restored[index].trim(rewind) != rewind {
+                return false
+            }
+        }
+        cache = restored
+        processedTokenCount = checkpoint.processedTokenCount
+
+        assert(
+            nativeAttentionOffsetsAreAligned,
+            "restoring a prompt checkpoint left the entries and the timeline out of step")
+        return true
     }
 
     /// Rewind a speculative tail across mixed attention and recurrent caches.
@@ -366,6 +450,8 @@ package final class KVCacheStorage {
             plan: plan,
             processedTokenCount: processedTokenCount)
         copy.isApplicationTerminal = isApplicationTerminal
+        // Restoring copies the snapshots, so both storages can share them.
+        copy.promptCheckpoint = promptCheckpoint
         return copy
     }
 

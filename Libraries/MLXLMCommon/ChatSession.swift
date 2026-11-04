@@ -459,11 +459,13 @@ public final class ChatSession {
         let parameters = generateParameters
         if let realized = await cache.read({ cache -> KVCacheStatus? in
             guard case .kvcache(let stored) = cache else { return nil }
-            return KVCacheStatus(
+            var status = KVCacheStatus(
                 cache: stored.main.cache,
                 plan: stored.main.plan,
                 phase: .realized,
                 processedTokenCount: stored.main.processedTokenCount)
+            status.promptCheckpointMemoryBytes = stored.main.promptCheckpoint?.memoryBytes ?? 0
+            return status
         }) {
             return realized
         }
@@ -1515,7 +1517,9 @@ public final class ChatSession {
                                 mainCacheIsAligned: mainCacheIsAligned,
                                 speculativeReuseCapability: speculativeReuseCapability,
                                 maxTrimCount: (kvCache.cache + (draftKVCache?.cache ?? []))
-                                    .map(\.maxTrimCount).min() ?? 0)
+                                    .map(\.maxTrimCount).min() ?? 0,
+                                checkpointTokenCount:
+                                    kvCache.promptCheckpoint?.processedTokenCount)
 
                             var decision = promptCachePolicy.decide(
                                 turn: turn, cache: cacheState)
@@ -1529,9 +1533,19 @@ public final class ChatSession {
                                 decision = .rebuild
                             }
 
-                            // Rewinding is the one decision that can fail while being
-                            // applied: a cache may trim fewer tokens than requested.
-                            // Verify and downgrade to a rebuild before prefilling.
+                            // Rewinding can fail while being applied: a cache may trim
+                            // fewer tokens than requested, or no longer reach its
+                            // checkpoint. Verify and downgrade to a rebuild before
+                            // prefilling.
+                            if case .restoreCheckpoint = decision {
+                                if !kvCache.restorePromptCheckpoint() {
+                                    decision = .rebuild
+                                } else if !currentConversation.transcriptBuiltCache {
+                                    // As for a trim below: keep only the prefix of the
+                                    // arrays this fork shares with its source.
+                                    kvCache = kvCache.copy()
+                                }
+                            }
                             if case .trimToCommonPrefix(let commonPrefixLength, let trimCount) =
                                 decision
                             {
@@ -1632,6 +1646,15 @@ public final class ChatSession {
                                 mtpDrafterContinuation = nil
                                 requiresMainOnlyContinuation = true
 
+                            case .restoreCheckpoint(let tokenCount):
+                                input = LMInput(
+                                    tokens: MLXArray(Array(promptTokenIds.dropFirst(tokenCount))))
+                                cachedPromptTokenCount = tokenCount
+                                // The checkpoint restores the main cache alone; any
+                                // speculative state is now at an offset it never visits.
+                                draftKVCache = nil
+                                mtpDrafterContinuation = nil
+
                             case .rebuild:
                                 kvCache = KVCacheStorage(
                                     try model.newCache(parameters: generateParameters),
@@ -1655,7 +1678,7 @@ public final class ChatSession {
                                 .appendMediaSuffix(_, let representedTokens):
                                 currentConversation.cachedTokens = representedTokens
                             case .prefillAll, .trimToCommonPrefix,
-                                .trimToCommonPrefixMainOnly, .rebuild:
+                                .trimToCommonPrefixMainOnly, .restoreCheckpoint, .rebuild:
                                 currentConversation.cachedTokens = promptTokenIds
                             }
                             currentConversation.uncommittedTokens.removeAll()
@@ -1705,6 +1728,13 @@ public final class ChatSession {
                                 state: lmState,
                                 parameters: generateParameters, components: components)
                             lmState = iterator.state
+
+                            // The iterator has prefilled the whole prompt. Keep the cache
+                            // as it stands so the next turn can return here, however long
+                            // this response runs. Carried state cannot be rewound at all.
+                            if conversation != nil, lmState == nil {
+                                kvCache.capturePromptCheckpoint()
+                            }
 
                             return startGeneration(iterator)
                         }

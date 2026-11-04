@@ -231,6 +231,69 @@ struct PromptCacheReusePolicyTests {
         #expect(decision.reusesCachedPrefix)
     }
 
+    /// A cache that can rewind only `maxTrimCount` tokens, with a prompt checkpoint.
+    private func checkpointedCache(
+        _ cached: [Int], maxTrimCount: Int, checkpoint: Int?
+    ) -> PromptCacheState {
+        PromptCacheState(
+            cachedTokens: cached, processedTokenCount: cached.count,
+            mainCacheIsAligned: true, speculativeReuseCapability: .reusable,
+            maxTrimCount: maxTrimCount, checkpointTokenCount: checkpoint)
+    }
+
+    @Test func `a rewind past the reserve restores the checkpoint within the common prefix`() {
+        // The cache holds prompt [1, 2, 3] and response [4, 5, 6]; the next turn
+        // drops the response, which the cache can rewind only one token over.
+        let decision = PromptCacheReusePolicy().decide(
+            turn: turn(prompt: [1, 2, 3, 9, 9]),
+            cache: checkpointedCache([1, 2, 3, 4, 5, 6], maxTrimCount: 1, checkpoint: 3))
+
+        #expect(decision == .restoreCheckpoint(tokenCount: 3))
+        #expect(decision.reusesCachedPrefix)
+    }
+
+    @Test func `a rewind within the reserve trims rather than restoring the checkpoint`() {
+        // Trimming keeps more of the cache than the checkpoint does.
+        #expect(
+            PromptCacheReusePolicy().decide(
+                turn: turn(prompt: [1, 2, 3, 4, 5, 9]),
+                cache: checkpointedCache([1, 2, 3, 4, 5, 6], maxTrimCount: 1, checkpoint: 3))
+                == .trimToCommonPrefix(commonPrefixLength: 5, trimCount: 1))
+    }
+
+    @Test func `a checkpoint past the common prefix is not restored`() {
+        #expect(
+            PromptCacheReusePolicy().decide(
+                turn: turn(prompt: [1, 2, 9, 9]),
+                cache: checkpointedCache([1, 2, 3, 4, 5, 6], maxTrimCount: 1, checkpoint: 3))
+                == .rebuild)
+    }
+
+    @Test func `a checkpoint covering the whole prompt is not restored`() {
+        // Its last token must still be fed, which the checkpoint has already consumed.
+        #expect(
+            PromptCacheReusePolicy().decide(
+                turn: turn(prompt: [1, 2, 3]),
+                cache: checkpointedCache([1, 2, 3, 4, 5, 6], maxTrimCount: 1, checkpoint: 3))
+                == .rebuild)
+    }
+
+    @Test func `speculative decoding blocks restoring the main cache's checkpoint`() {
+        #expect(
+            PromptCacheReusePolicy().decide(
+                turn: turn(prompt: [1, 2, 3, 9], speculative: true),
+                cache: checkpointedCache([1, 2, 3, 4, 5, 6], maxTrimCount: 1, checkpoint: 3))
+                == .rebuild)
+    }
+
+    @Test func `carried model state blocks restoring a checkpoint`() {
+        #expect(
+            PromptCacheReusePolicy().decide(
+                turn: turn(prompt: [1, 2, 3, 9], modelState: true),
+                cache: checkpointedCache([1, 2, 3, 4, 5, 6], maxTrimCount: 1, checkpoint: 3))
+                == .rebuild)
+    }
+
     @Test func `a fully divergent prompt rebuilds rather than rewinding to nothing`() {
         #expect(
             PromptCacheReusePolicy().decide(
