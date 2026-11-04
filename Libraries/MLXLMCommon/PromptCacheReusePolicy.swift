@@ -287,9 +287,12 @@ struct RewindToCommonPrefixRule: PromptCacheReuseRule {
             return .prefillAll
         }
 
-        let commonPrefixLength = zip(turn.promptTokens, cache.cachedTokens)
-            .prefix { $0 == $1 }
-            .count
+        // A prompt the cache already holds in full -- a retry, or a prompt cut
+        // short of the cached response -- still needs its last token fed so the
+        // model produces logits to sample from. Rewind one token further.
+        let commonPrefixLength = min(
+            zip(turn.promptTokens, cache.cachedTokens).prefix { $0 == $1 }.count,
+            turn.promptTokens.count - 1)
         let trimCount = cache.cachedTokens.count - commonPrefixLength
 
         let canRewind =

@@ -1828,6 +1828,58 @@ public class ChatSessionTests: XCTestCase {
         XCTAssertGreaterThan(second.info.cacheEfficiency, 0)
     }
 
+    func testIdenticalPromptReusesAllButItsLastToken() async throws {
+        let (renderedLengths, continuation) = AsyncStream<Int>.makeStream()
+        var lengthIterator = renderedLengths.makeAsyncIterator()
+        let tokenizer = PrefixPreservingTokenizer(renderedLengthContinuation: continuation)
+        let processor = TestInputProcessor(
+            tokenizer: tokenizer,
+            configuration: ModelConfiguration(id: "test"),
+            messageGenerator: DefaultMessageGenerator())
+        let session = ChatSession(
+            model(processor: processor),
+            generateParameters: GenerateParameters(maxTokens: 3))
+
+        _ = try await session.respond(to: "first")
+        let firstRenderedLength = await lengthIterator.next()
+        let firstPromptLength = try XCTUnwrap(firstRenderedLength)
+
+        // A retry of the same turn: the cache holds the whole prompt and the response.
+        let retry = await session.fork(history: [])
+        let reply = try await collectGeneration(retry.streamDetails(to: "first"))
+
+        XCTAssertEqual(reply.info.cachedPromptTokenCount, firstPromptLength - 1)
+        XCTAssertEqual(reply.info.totalPromptTokenCount, firstPromptLength)
+    }
+
+    func testInterruptedGenerationKeepsItsPromptCache() async throws {
+        let (renderedLengths, continuation) = AsyncStream<Int>.makeStream()
+        var lengthIterator = renderedLengths.makeAsyncIterator()
+        let tokenizer = PrefixPreservingTokenizer(renderedLengthContinuation: continuation)
+        let processor = TestInputProcessor(
+            tokenizer: tokenizer,
+            configuration: ModelConfiguration(id: "test"),
+            messageGenerator: DefaultMessageGenerator())
+        let session = ChatSession(
+            model(processor: processor),
+            generateParameters: GenerateParameters(maxTokens: 50))
+
+        for try await _ in session.streamDetails(to: "first") {
+            break
+        }
+        await session.synchronize()
+        let firstRenderedLength = await lengthIterator.next()
+        let firstPromptLength = try XCTUnwrap(firstRenderedLength)
+
+        // The interrupted turn was rolled back, so the retry renders the same prompt
+        // and rewinds over the partial response rather than prefilling it again.
+        session.generateParameters = GenerateParameters(maxTokens: 3)
+        let reply = try await collectGeneration(session.streamDetails(to: "first"))
+
+        XCTAssertEqual(reply.info.cachedPromptTokenCount, firstPromptLength - 1)
+        XCTAssertEqual(reply.info.totalPromptTokenCount, firstPromptLength)
+    }
+
     func testExactPrefixReuseRebuildsWhenPreparedInputHasMask() async throws {
         let (renderedLengths, continuation) = AsyncStream<Int>.makeStream()
         var lengthIterator = renderedLengths.makeAsyncIterator()

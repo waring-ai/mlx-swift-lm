@@ -85,12 +85,29 @@ struct PromptCacheReusePolicyTests {
         #expect(decision.reusesCachedPrefix)
     }
 
-    @Test func `an identical prompt has no suffix to append and rebuilds`() {
-        // No new tokens: the common prefix spans the whole prompt, so there is
-        // nothing to prefill and nothing safe to rewind to.
+    @Test func `an identical prompt rewinds one token to refeed its last token`() {
+        // No new tokens: the common prefix spans the whole prompt, so the last
+        // token is rewound and fed again to produce logits.
         #expect(
             PromptCacheReusePolicy().decide(
-                turn: turn(prompt: [1, 2, 3]), cache: alignedCache([1, 2, 3])) == .rebuild)
+                turn: turn(prompt: [1, 2, 3]), cache: alignedCache([1, 2, 3]))
+                == .trimToCommonPrefix(commonPrefixLength: 2, trimCount: 1))
+    }
+
+    @Test func `a prompt the cache extends past rewinds to just before its last token`() {
+        // A retry of a turn whose response is cached: the prompt is a strict
+        // prefix of the ledger, which also holds the generated tokens.
+        #expect(
+            PromptCacheReusePolicy().decide(
+                turn: turn(prompt: [1, 2, 3]), cache: alignedCache([1, 2, 3, 4, 5]))
+                == .trimToCommonPrefix(commonPrefixLength: 2, trimCount: 3))
+    }
+
+    @Test func `a single-token prompt the cache holds rebuilds`() {
+        // Rewinding one token would leave nothing to reuse.
+        #expect(
+            PromptCacheReusePolicy().decide(
+                turn: turn(prompt: [1]), cache: alignedCache([1, 2])) == .rebuild)
     }
 
     @Test func `a misaligned draft cache blocks suffix reuse`() {

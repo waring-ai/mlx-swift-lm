@@ -221,16 +221,6 @@ public final class ChatSession {
             generatedTokens: [Int],
             processedTokenCount: Int
         ) -> Bool {
-            guard assistant.shouldRecord else {
-                // A cancelled or semantically empty generation has no
-                // assistant turn to replay. Its cache may nevertheless
-                // contain generated or lookahead tokens, so invalidate
-                // the ledger and rebuild from the retained messages.
-                cachedTokens.removeAll()
-                uncommittedTokens.removeAll()
-                return false
-            }
-
             let cachedTokenCount = cachedTokens.count
             if processedTokenCount >= cachedTokenCount,
                 processedTokenCount - cachedTokenCount <= generatedTokens.count
@@ -246,6 +236,17 @@ public final class ChatSession {
                 // un-emitted lookahead).
                 cachedTokens.removeAll()
                 uncommittedTokens.removeAll()
+            }
+
+            guard assistant.shouldRecord else {
+                // A cancelled or semantically empty generation has no
+                // assistant turn to replay. The ledger still names exactly
+                // what the cache holds -- the prompt and the generated tokens
+                // committed so far -- so a later prompt rewinds over the
+                // partial response instead of prefilling the prompt again.
+                // Nothing generated is carried forward as uncommitted.
+                uncommittedTokens.removeAll()
+                return false
             }
 
             // A turn that produced only reasoning appends an empty assistant message.
@@ -1945,8 +1946,8 @@ public final class ChatSession {
                                 generatedTokens: generatedTokens,
                                 processedTokenCount: kvCache.processedTokenCount)
                             if !recordedAssistant {
-                                // The target ledger is invalidated below, so an MTP witness tied
-                                // to that boundary must not escape this generation pass.
+                                // The turn is rolled back, so an MTP witness tied to its
+                                // boundary must not escape this generation pass.
                                 mtpDrafterContinuation = nil
                                 if let conversationMessageCountBeforePending {
                                     // A cancelled or empty generation did not commit an
