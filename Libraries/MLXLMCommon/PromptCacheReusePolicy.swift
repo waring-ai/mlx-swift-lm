@@ -67,6 +67,22 @@ enum PromptCacheReuseDecision: Equatable {
             return false
         }
     }
+
+    /// Leading prompt tokens taken from the cache rather than prefilled, once applied.
+    var reusedTokenCount: Int {
+        switch self {
+        case .appendSuffix(let suffixStart, _), .appendSuffixToMain(let suffixStart, _),
+            .appendMediaSuffix(let suffixStart, _):
+            return suffixStart
+        case .trimToCommonPrefix(let commonPrefixLength, _),
+            .trimToCommonPrefixMainOnly(let commonPrefixLength, _):
+            return commonPrefixLength
+        case .restoreCheckpoint(let tokenCount):
+            return tokenCount
+        case .prefillAll, .rebuild:
+            return 0
+        }
+    }
 }
 
 /// The prompt-side facts of one turn that affect cache reuse.

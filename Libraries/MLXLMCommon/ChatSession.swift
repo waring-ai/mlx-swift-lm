@@ -472,6 +472,133 @@ public final class ChatSession {
         return try await model.cacheStatus(parameters: parameters)
     }
 
+    /// How a generation would reconcile its prompt with this session's cache.
+    public struct PromptCacheReuse: Sendable, Equatable {
+        /// The prompt as the generation would render it; empty when the session holds no
+        /// cache to reuse, since nothing then needs rendering.
+        public var promptTokens: [Int]
+        /// Leading `promptTokens` the generation would take from the cache instead of
+        /// prefilling.
+        public var reusedTokenCount: Int
+
+        public init(promptTokens: [Int] = [], reusedTokenCount: Int = 0) {
+            self.promptTokens = promptTokens
+            self.reusedTokenCount = reusedTokenCount
+        }
+    }
+
+    /// What a generation of `pending` would reuse of this session's cache, decided by the
+    /// same policy a generation applies, without prefilling or changing the cache.
+    ///
+    /// `history` stands in for the session's transcript as ``fork(history:)`` would pair it
+    /// with this cache; `nil` keeps the transcript the cache was built from. A rewind or
+    /// checkpoint restore that a generation would find fails only while being applied is
+    /// still reported as reuse, as is a speculative continuation the generation would
+    /// later abandon. A cache restored without its transcript, and any transcript with
+    /// media, report none.
+    public func promptCacheReuse(
+        history: [Chat.Message]? = nil, pending: [Chat.Message]
+    ) async throws -> PromptCacheReuse {
+        let parameters = generateParameters
+        let kvCachePlan = try parameters.kvCachePlan()
+        let model = await self.model.perform { context in SendableBox(context.model) }.consume()
+        let desiredLayerKinds = try model.cacheStatus(parameters: parameters).layers.map(\.kind)
+        let usesSpeculativeDecoding = speculativeDecoding != nil
+        let usesMTP: Bool
+        if case .mtp = speculativeDecoding?.strategy { usesMTP = true } else { usesMTP = false }
+        let carriesMedia: @Sendable ([Chat.Message]) -> Bool = { messages in
+            messages.contains { !$0.images.isEmpty || !$0.videos.isEmpty || !$0.audios.isEmpty }
+        }
+        guard !carriesMedia(pending), !(history.map(carriesMedia) ?? false) else {
+            return PromptCacheReuse()
+        }
+
+        // Everything the decision needs from the cache, read without changing it.
+        struct Snapshot: @unchecked Sendable {
+            var conversation: Conversation
+            var state: PromptCacheState
+            var carriesModelState: Bool
+        }
+        let replacement = SendableBox(history)
+        let snapshot = await cache.read { cache -> Snapshot? in
+            guard case .kvcache(let stored) = cache, var conversation = stored.conversation,
+                stored.main.plan == kvCachePlan,
+                KVCacheStatus(
+                    cache: stored.main.cache, plan: stored.main.plan, phase: .realized,
+                    processedTokenCount: stored.main.processedTokenCount
+                ).layers.map(\.kind) == desiredLayerKinds,
+                !carriesMedia(conversation.messages)
+            else {
+                // Nothing realized, a transcript to rebuild from, a changed cache policy
+                // (which rebuilds), or a raw cache with no transcript to reconcile against.
+                return nil
+            }
+            if let history = replacement.consume() {
+                conversation.messages = history
+                conversation.transcriptBuiltCache = false
+            }
+            let processed = stored.main.processedTokenCount
+            let speculativeReuseCapability: SpeculativeCacheReuseCapability
+            if !usesSpeculativeDecoding {
+                speculativeReuseCapability = .unavailable
+            } else if usesMTP {
+                // Whether an MTP drafter's state can follow is only known once it is
+                // loaded; the main cache can always continue alone.
+                speculativeReuseCapability = .mainOnlyFallback
+            } else if let draft = stored.draft {
+                speculativeReuseCapability =
+                    draft.processedTokenCount == conversation.cachedTokens.count
+                    ? .reusable : .unavailable
+            } else {
+                speculativeReuseCapability = .rebuildableFromPrompt
+            }
+            return Snapshot(
+                conversation: conversation,
+                state: PromptCacheState(
+                    cachedTokens: conversation.cachedTokens,
+                    processedTokenCount: processed,
+                    mainCacheIsAligned: processed == conversation.cachedTokens.count,
+                    speculativeReuseCapability: speculativeReuseCapability,
+                    maxTrimCount: (stored.main.cache + (stored.draft?.cache ?? []))
+                        .map(\.maxTrimCount).min() ?? 0,
+                    checkpointTokenCount: stored.main.promptCheckpoint?.processedTokenCount),
+                carriesModelState: stored.state != nil)
+        }
+        guard let snapshot else { return PromptCacheReuse() }
+
+        let modelConfiguration = await self.model.configuration
+        let tokenizer = await self.model.tokenizer
+        let conversation = snapshot.conversation
+        let templateMessages =
+            (instructions.map { [Chat.Message.system($0)] } ?? []) + conversation.messages
+            + pending
+        let preparedInput = try await self.model.processor.prepare(
+            input: UserInput(
+                chat: templateMessages, processing: processing, tools: tools,
+                additionalContext: additionalContext))
+        let turn = PromptCacheTurn(
+            promptTokens: preparedInput.text.tokens.asArray(Int.self),
+            carriesNewMedia: false,
+            carriesPreparedMedia: preparedInput.image != nil || preparedInput.video != nil
+                || preparedInput.audio != nil,
+            carriesAttentionMask: preparedInput.text.mask != nil,
+            carriesModelState: snapshot.carriesModelState,
+            isToolResultContinuation: pending.contains { $0.role == .tool }
+                && conversation.messages.last?.tool?.calls?.isEmpty == false
+                && conversation.transcriptBuiltCache,
+            previousGenerationUncommittedTokens: conversation.uncommittedTokens,
+            structuredToolCallCount: modelConfiguration.toolCallFormat?
+                .promptCacheStructuredToolCallCount(in: templateMessages),
+            usesSpeculativeDecoding: usesSpeculativeDecoding,
+            canSplitPreparedMedia: model is PreparedInputSplitting)
+        let policy = PromptCacheReusePolicy(
+            protocolRules: modelConfiguration.toolCallFormat?
+                .promptCacheReuseRules(tokenizer: tokenizer) ?? [])
+        return PromptCacheReuse(
+            promptTokens: turn.promptTokens,
+            reusedTokenCount: policy.decide(turn: turn, cache: snapshot.state).reusedTokenCount)
+    }
+
     /// Initialize the `ChatSession`.
     ///
     /// - Parameters:

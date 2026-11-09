@@ -1852,6 +1852,37 @@ public class ChatSessionTests: XCTestCase {
         XCTAssertEqual(reply.info.totalPromptTokenCount, firstPromptLength)
     }
 
+    func testPromptCacheReuseMatchesTheNextGeneration() async throws {
+        let (_, continuation) = AsyncStream<Int>.makeStream()
+        let tokenizer = PrefixPreservingTokenizer(renderedLengthContinuation: continuation)
+        let processor = TestInputProcessor(
+            tokenizer: tokenizer,
+            configuration: ModelConfiguration(id: "test"),
+            messageGenerator: DefaultMessageGenerator())
+        let session = ChatSession(
+            model(processor: processor),
+            generateParameters: GenerateParameters(maxTokens: 3))
+
+        let cold = try await session.promptCacheReuse(pending: [.user("first")])
+        XCTAssertEqual(cold, ChatSession.PromptCacheReuse(), "Nothing is cached before a generation")
+
+        _ = try await session.respond(to: "first")
+        let next = try await session.promptCacheReuse(pending: [.user("second")])
+        let again = try await session.promptCacheReuse(pending: [.user("second")])
+        XCTAssertEqual(again, next, "Checking leaves the cache as it was")
+        let retry = try await session.promptCacheReuse(history: [], pending: [.user("first")])
+
+        let retried = try await collectGeneration(
+            session.fork(history: []).streamDetails(to: "first"))
+        XCTAssertEqual(retry.reusedTokenCount, retried.info.cachedPromptTokenCount)
+        XCTAssertEqual(retry.promptTokens.count, retried.info.totalPromptTokenCount)
+
+        let second = try await collectGeneration(session.streamDetails(to: "second"))
+        XCTAssertGreaterThan(next.reusedTokenCount, 0)
+        XCTAssertEqual(next.reusedTokenCount, second.info.cachedPromptTokenCount)
+        XCTAssertEqual(next.promptTokens.count, second.info.totalPromptTokenCount)
+    }
+
     func testInterruptedGenerationKeepsItsPromptCache() async throws {
         let (renderedLengths, continuation) = AsyncStream<Int>.makeStream()
         var lengthIterator = renderedLengths.makeAsyncIterator()
