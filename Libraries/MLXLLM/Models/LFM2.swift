@@ -498,6 +498,12 @@ public class LFM2Model: Module, LLMModel, KVCacheDimensionProvider,
         return model.embedTokens.asLinear(out)
     }
 
+    /// Vocabulary logits for final hidden states from ``LFM2ModelInner``, through the tied token embedding.
+    /// Lets callers project only the positions they read, such as a decision's answer slot.
+    public func projectLogits(_ hiddenStates: MLXArray) -> MLXArray {
+        model.embedTokens.asLinear(hiddenStates)
+    }
+
     public func callAsFunction(
         _ input: LMInput.Text, cache: [KVCache]?, state: LMOutput.State?
     ) -> LMOutput {
