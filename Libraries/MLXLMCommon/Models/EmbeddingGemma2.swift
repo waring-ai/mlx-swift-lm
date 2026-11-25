@@ -686,9 +686,8 @@ private final class EmbeddingGemma2Attention: Module {
         // Values are normalized without a learned scale; the query and key norms replace
         // the 1/sqrt(d) scale.
         let v = MLXFast.rmsNorm(
-            rawValues, weight: MLXArray.ones([headDim], dtype: .float32), eps: eps
+            rawValues, weight: MLXArray.ones([headDim], dtype: rawValues.dtype), eps: eps
         )
-        .asType(rawValues.dtype)
         .transposed(0, 2, 1, 3)
         let output = span.attention(queries: q, keys: k, values: v)
         return oProj(output.transposed(0, 2, 1, 3).reshaped(batch, length, -1))
@@ -745,8 +744,10 @@ private final class EmbeddingGemma2RMSNorm: Module {
         super.init()
     }
 
+    // Stays in the input dtype: the kernel already sums in float32, and a float32 round
+    // trip adds two casts to every norm.
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        MLXFast.rmsNorm(x, weight: weight.asType(.float32), eps: eps).asType(x.dtype)
+        MLXFast.rmsNorm(x, weight: weight.asType(x.dtype), eps: eps)
     }
 }
 
