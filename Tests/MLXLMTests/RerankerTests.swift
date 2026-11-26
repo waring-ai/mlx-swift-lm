@@ -702,7 +702,7 @@ struct RerankerTests {
         }
     }
 
-    @Test func causalScoringProjectsFinalTokensAndKeepsSingletonPrefill() async throws {
+    @Test func causalScoringProjectsFinalTokensOfBatchesAndSingletons() async throws {
         let tokenizer = ByteRerankerTokenizer()
         let container = makeModelContainer(
             model: TestHiddenStateRerankerModel(tokenizer: tokenizer), tokenizer: tokenizer)
@@ -725,9 +725,81 @@ struct RerankerTests {
         }
 
         #expect(actual == expected)
-        #expect(calls.0.map(\.first) == [2])
-        #expect(calls.1 == [[2, 128]])
-        #expect(calls.2 == [[1, 512]])
+        #expect(calls.0.map(\.first) == [2, 1])
+        #expect(calls.1 == [[2, 128], [1, 128]])
+        #expect(calls.2.isEmpty)
+    }
+
+    @Test func causalScoringBatchesDocumentsOfSimilarLength() async throws {
+        let tokenizer = ByteRerankerTokenizer()
+        let model = TestCausalRerankerModel(
+            trueTokenID: tokenizer.trueTokenID,
+            falseTokenID: tokenizer.falseTokenID)
+        let container = makeModelContainer(model: model, tokenizer: tokenizer)
+        let long = String(repeating: "b", count: 201)
+
+        _ = try await container.causalRerankerScores(
+            query: "q",
+            documents: [long, "a", long, "a"],
+            instruction: nil,
+            maxInputTokens: 8_192,
+            options: .init())
+
+        // One batch of four would pad both short documents by 200 tokens.
+        #expect(model.callShapes.map(\.first) == [2, 2])
+        #expect(model.callShapes[1][1] - model.callShapes[0][1] == 200)
+    }
+
+    @Test func causalScoringRunsTheSharedPromptPrefixOnce() async throws {
+        let tokenizer = ByteRerankerTokenizer()
+        let configuration = try JSONDecoder().decode(
+            MLXLLM.Qwen3Configuration.self,
+            from: Data(
+                """
+                {
+                  "vocab_size": 160, "hidden_size": 64, "num_hidden_layers": 2,
+                  "intermediate_size": 128, "num_attention_heads": 4,
+                  "num_key_value_heads": 2, "head_dim": 16, "rms_norm_eps": 1e-6
+                }
+                """.utf8))
+        let model = withRandomState(MLXRandom.RandomState(seed: 7)) {
+            RecordingCausalModel(MLXLLM.Qwen3Model(configuration))
+        }
+        let container = makeModelContainer(model: model, tokenizer: tokenizer)
+        // The last document is long enough to be prefilled alone.
+        let documents = [
+            "alpha", "beta gamma", String(repeating: "delta ", count: 20),
+            String(repeating: "e", count: 600),
+        ]
+        let prompts = try documents.map {
+            try Qwen3RerankerInputProcessor().encode(
+                query: "q", document: $0, tokenizer: tokenizer,
+                maxInputTokens: nil, truncation: .truncate
+            ).tokenIds
+        }
+        let shared = prompts[0].indices.first { index in
+            prompts.contains { $0[index] != prompts[0][index] }
+        }
+        let prefix = try #require(shared)
+
+        let together = try await container.causalRerankerScores(
+            query: "q", documents: documents, instruction: nil,
+            maxInputTokens: 8_192, options: .init())
+        let shapes = model.shapes
+        var alone = [Double]()
+        for document in documents {
+            alone += try await container.causalRerankerScores(
+                query: "q", documents: [document], instruction: nil,
+                maxInputTokens: 8_192, options: .init())
+        }
+
+        #expect(shapes.first == [1, prefix])
+        #expect(shapes.dropFirst().reduce(0) { $0 + $1[0] } == documents.count)
+        #expect(shapes.last == [1, prompts[3].count - prefix])
+        #expect(shapes.dropFirst().allSatisfy { $0[1] <= prompts[3].count - prefix })
+        for (shared, single) in zip(together, alone) {
+            #expect(abs(shared - single) < 1e-4)
+        }
     }
 
     @Test func jinaFactoryRegistrationUsesArchitecture() async throws {
@@ -1125,6 +1197,33 @@ private final class TestHiddenStateRerankerModel: Module, HiddenStateLanguageMod
     }
 
     func newCache(parameters: GenerateParameters?) -> [KVCache] { [] }
+}
+
+/// Records the token shapes it passes to a real model.
+private final class RecordingCausalModel: Module, LanguageModel, @unchecked Sendable {
+    private let base: MLXLLM.Qwen3Model
+    private(set) var shapes = [[Int]]()
+
+    init(_ base: MLXLLM.Qwen3Model) {
+        self.base = base
+    }
+
+    func prepare(
+        _ input: LMInput, cache: [KVCache], state: LMOutput.State?, prefill: PrefillParameters
+    ) throws -> PrepareResult {
+        .tokens(input.text)
+    }
+
+    func callAsFunction(
+        _ input: LMInput.Text, cache: [KVCache]?, state: LMOutput.State?
+    ) -> LMOutput {
+        shapes.append(input.tokens.shape)
+        return base(input, cache: cache, state: state)
+    }
+
+    func newCache(parameters: GenerateParameters?) throws -> [KVCache] {
+        try base.newCache(parameters: parameters)
+    }
 }
 
 private final class TestCausalRerankerModel: Module, LanguageModel, ListwiseRerankerModel,

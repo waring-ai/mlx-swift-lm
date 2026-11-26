@@ -964,11 +964,21 @@ extension ModelContainer {
                 }
             }
 
+            let prefix = try scorer.sharedPrefix(of: encoded, model: context.model)
+            let batches = causalMicroBatches(
+                encoded, sharedTokens: prefix?.tokenCount ?? 0, options: options)
+            let start = { (batch: [EncodedCausalDocument]) in
+                try scorer.startScoring(batch: batch, prefix: prefix, model: context.model)
+            }
             var scores = [Double?](repeating: nil, count: documents.count)
-            for batch in causalMicroBatches(encoded, options: options) {
+            // The next batch starts before this one's scores are read, so the GPU is not idle
+            // while a forward pass is built.
+            var next = try batches.first.map(start)
+            for (index, batch) in batches.enumerated() {
                 try Task.checkCancellation()
-                let batchScores = try scorer.score(batch: batch, model: context.model)
-                for (document, score) in zip(batch, batchScores) {
+                guard let logits = next else { break }
+                next = try batches.dropFirst(index + 1).first.map(start)
+                for (document, score) in zip(batch, scorer.probabilities(logits)) {
                     scores[document.index] = score
                 }
             }
@@ -1040,58 +1050,122 @@ private struct CausalLMReranker {
         return input
     }
 
-    func score(
-        batch: [EncodedCausalDocument], model: any LanguageModel
-    ) throws -> [Double] {
-        let classifierTokens = try resolveClassifierTokens()
-        if batch.count == 1, let input = batch.first?.input {
-            let lmInput = LMInput(tokens: MLXArray(input.tokenIds))
-            let cache = try model.newCache(parameters: nil)
-            let output = try nextTokenLogits(input: lmInput, model: model, cache: cache)
-            let logits = output[0..., -1, 0...]
-            return [probability(logits: logits, tokens: classifierTokens)]
+    /// Runs the tokens every prompt starts with once, so each row computes only what follows.
+    ///
+    /// Returns `nil` when too few tokens are shared or the model's caches are not plain
+    /// key-value caches.
+    func sharedPrefix(
+        of documents: [EncodedCausalDocument], model: any LanguageModel
+    ) throws -> SharedCausalPrefix? {
+        guard documents.count > 1, let first = documents.first?.input.tokenIds else {
+            return nil
         }
+        // Each row keeps a token of its own to read the logits from.
+        var count = (documents.map(\.input.tokenIds.count).min() ?? 1) - 1
+        for document in documents.dropFirst() {
+            count = zip(first.prefix(count), document.input.tokenIds).prefix { $0 == $1 }.count
+        }
+        guard count >= minimumSharedPrefixTokens else { return nil }
 
-        let maxLength = batch.map(\.input.tokenIds.count).max() ?? 0
-        var inputIDs = [Int]()
-        inputIDs.reserveCapacity(batch.count * maxLength)
-        for document in batch {
-            inputIDs += document.input.tokenIds
-            inputIDs += Array(
-                repeating: 0,
-                count: maxLength - document.input.tokenIds.count)
+        let cache = try model.newCache(parameters: nil)
+        guard !cache.isEmpty, cache.allSatisfy({ type(of: $0) == KVCacheSimple.self }) else {
+            return nil
         }
-        let tokens = MLXArray(inputIDs).reshaped(batch.count, maxLength)
-        let lengths = batch.map(\.input.tokenIds.count)
-        let logits =
-            if let model = model as? any HiddenStateLanguageModel {
-                model.projectLogits(
-                    lastPositions(model.hiddenStates(tokens, cache: nil), lengths: lengths))
-            } else {
-                lastPositions(
-                    model(LMInput.Text(tokens: tokens), cache: nil, state: nil).logits,
-                    lengths: lengths)
-            }
-        MLX.eval(logits)
-        return batch.indices.map { row in
-            probability(logits: logits[row], tokens: classifierTokens)
+        var start = 0
+        while start < count {
+            let end = min(start + options.prefillStepSize, count)
+            let tokens = MLXArray(first[start ..< end]).reshaped(1, end - start)
+            _ = model(LMInput.Text(tokens: tokens), cache: cache, state: nil)
+            MLX.eval(cache.flatMap(\.state))
+            start = end
+        }
+        return SharedCausalPrefix(
+            tokenCount: count,
+            layers: cache.map { layer in
+                let state = layer.state
+                return (keys: state[0], values: state[1])
+            })
+    }
+
+    /// Starts a batch on the GPU without waiting for it.
+    ///
+    /// Returns each row's two classifier logits, `[rows, 2]`, for `probabilities(_:)` to read.
+    func startScoring(
+        batch: [EncodedCausalDocument], prefix: SharedCausalPrefix?, model: any LanguageModel
+    ) throws -> MLXArray {
+        let tokens = try resolveClassifierTokens()
+        let logits = try nextTokenLogits(batch: batch, prefix: prefix, model: model)
+        let classifierLogits = take(
+            logits, MLXArray([Int32(tokens.trueTokenId), Int32(tokens.falseTokenId)]), axis: -1
+        ).asType(.float32)
+        asyncEval(classifierLogits)
+        return classifierLogits
+    }
+
+    /// Waits for the logits `startScoring` returned and maps each row to its score.
+    func probabilities(_ classifierLogits: MLXArray) -> [Double] {
+        let pairs = classifierLogits.asArray(Float.self)
+        return stride(from: 0, to: pairs.count, by: 2).map { row in
+            RerankerScoreTransform.sigmoid(Double(pairs[row]) - Double(pairs[row + 1]))
         }
     }
 
+    /// Next-token logits `[rows, vocabulary]` of a batch whose rows follow `prefix`.
+    private func nextTokenLogits(
+        batch: [EncodedCausalDocument], prefix: SharedCausalPrefix?, model: any LanguageModel
+    ) throws -> MLXArray {
+        let shared = prefix?.tokenCount ?? 0
+        // A long prompt on its own is prefilled in steps, which bounds its attention memory.
+        if batch.count == 1, let input = batch.first?.input,
+            input.tokenIds.count - shared >= options.prefillStepSize
+        {
+            return try nextTokenLogits(
+                input: LMInput(tokens: MLXArray(Array(input.tokenIds.dropFirst(shared)))),
+                model: model,
+                cache: prefix?.prefilledCache() ?? model.newCache(parameters: nil))
+        }
+
+        let lengths = batch.map { $0.input.tokenIds.count - shared }
+        let maxLength = lengths.max() ?? 0
+        var inputIDs = [Int]()
+        inputIDs.reserveCapacity(batch.count * maxLength)
+        for (document, length) in zip(batch, lengths) {
+            inputIDs += document.input.tokenIds.dropFirst(shared)
+            inputIDs += Array(repeating: 0, count: maxLength - length)
+        }
+        let tokens = MLXArray(inputIDs).reshaped(batch.count, maxLength)
+        let cache = prefix?.cache()
+        if let model = model as? any HiddenStateLanguageModel {
+            return model.projectLogits(
+                lastPositions(model.hiddenStates(tokens, cache: cache), lengths: lengths))
+        }
+        return lastPositions(
+            model(LMInput.Text(tokens: tokens), cache: cache, state: nil).logits,
+            lengths: lengths)
+    }
+
+    /// Next-token logits `[1, vocabulary]` after `input` is prefilled into `cache`.
     private func nextTokenLogits(
         input: LMInput, model: any LanguageModel, cache: [KVCache]
     ) throws -> MLXArray {
+        // Full steps keep every forward but the last on whole matmul blocks.
         switch try model.prepare(
             input,
             cache: cache,
             state: nil,
-            prefill: .init(stepSize: options.prefillStepSize)
+            prefill: .init(stepSize: options.prefillStepSize, chunking: .remainder)
         ) {
         case .logits(let output):
-            return output.logits
+            return output.logits[0..., -1, 0...]
         case .tokens(let tokens):
             return withPreparedCache(cache, lengths: tokens.sequenceLengths) {
-                model(tokens[text: .newAxis], cache: cache.isEmpty ? nil : cache, state: nil).logits
+                let text = tokens[text: .newAxis]
+                let cache = cache.isEmpty ? nil : cache
+                if let model = model as? any HiddenStateLanguageModel {
+                    return model.projectLogits(
+                        model.hiddenStates(text.tokens, cache: cache)[0..., -1, 0...])
+                }
+                return model(text, cache: cache, state: nil).logits[0..., -1, 0...]
             }
         }
     }
@@ -1119,21 +1193,6 @@ private struct CausalLMReranker {
         return tokenId
     }
 
-    private func scalarLogit(_ logits: MLXArray, tokenId: Int) -> Double {
-        if logits.ndim == 1 {
-            return Double(logits[tokenId].item(Float.self))
-        }
-        return Double(logits[0, tokenId].item(Float.self))
-    }
-
-    private func probability(
-        logits: MLXArray,
-        tokens: (trueTokenId: Int, falseTokenId: Int)
-    ) -> Double {
-        let trueLogit = scalarLogit(logits, tokenId: tokens.trueTokenId)
-        let falseLogit = scalarLogit(logits, tokenId: tokens.falseTokenId)
-        return RerankerScoreTransform.sigmoid(trueLogit - falseLogit)
-    }
 }
 
 private struct EncodedCausalDocument {
@@ -1141,36 +1200,109 @@ private struct EncodedCausalDocument {
     var input: RerankerInput
 }
 
+/// The attention state of the tokens every prompt of a request starts with.
+private struct SharedCausalPrefix {
+    var tokenCount: Int
+    /// Each layer's keys and values, `[1, heads, tokenCount, dimensions]`.
+    var layers: [(keys: MLXArray, values: MLXArray)]
+
+    /// Caches that put the prefix before the rows of one forward pass.
+    func cache() -> [KVCache] {
+        layers.map { SharedPrefixKVCache(keys: $0.keys, values: $0.values) }
+    }
+
+    /// Caches that hold the prefix and keep what one row's prefill appends.
+    func prefilledCache() -> [KVCache] {
+        layers.map { layer in
+            let cache = KVCacheSimple()
+            cache.state = [layer.keys, layer.values]
+            return cache
+        }
+    }
+}
+
+/// Presents a shared prefix's keys and values to every row of a batch.
+///
+/// It keeps nothing it is given, so one prefix serves any number of forward passes.
+private final class SharedPrefixKVCache: BaseKVCache {
+    private let keys: MLXArray
+    private let values: MLXArray
+
+    init(keys: MLXArray, values: MLXArray) {
+        self.keys = keys
+        self.values = values
+        super.init()
+        offset = keys.dim(2)
+    }
+
+    override func innerState() -> [MLXArray] { [keys, values] }
+
+    override func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
+        (joined(self.keys, keys), joined(self.values, values))
+    }
+
+    override func copy() -> any KVCache {
+        SharedPrefixKVCache(keys: keys, values: values)
+    }
+
+    private func joined(_ shared: MLXArray, _ rows: MLXArray) -> MLXArray {
+        let shape = [rows.dim(0)] + shared.shape.dropFirst()
+        return concatenated([broadcast(shared, to: shape), rows], axis: 2)
+    }
+}
+
+/// Fewer shared tokens than this are not worth a forward pass of their own.
+private let minimumSharedPrefixTokens = 8
+
+/// What a forward pass costs before it reads a token, in tokens.
+private let causalBatchOverheadTokens = 8
+
+/// MLX's quantized matrix multiply computes rows in blocks of this many, at one cost per block.
+private let causalBatchBlockTokens = 32
+
 /// Selects position `length - 1` of each right-padded row, mapping `[B, L, D]` to `[B, D]`.
 private func lastPositions(_ array: MLXArray, lengths: [Int]) -> MLXArray {
     let indices = MLXArray(lengths.map { Int32($0 - 1) }).reshaped(-1, 1, 1)
     return takeAlong(array, indices, axis: 1).squeezed(axis: 1)
 }
 
+/// Cuts documents, sorted by length, into batches that pad each row to the batch's longest.
+///
+/// Of the cuts within the batch limits, this takes the cheapest: a batch costs its padded
+/// tokens after `sharedTokens` per row, in whole matmul blocks, plus a fixed overhead.
 private func causalMicroBatches(
     _ documents: [EncodedCausalDocument],
+    sharedTokens: Int = 0,
     options: RerankExecutionOptions
 ) -> [[EncodedCausalDocument]] {
-    var batches = [[EncodedCausalDocument]]()
-    var batch = [EncodedCausalDocument]()
-    var longest = 0
-    for document in documents {
-        let nextLongest = max(longest, document.input.tokenIds.count)
-        let nextCount = batch.count + 1
-        if !batch.isEmpty,
-            nextCount > options.maxBatchSize || nextLongest * nextCount > options.maxBatchTokens
-        {
-            batches.append(batch)
-            batch = []
-            longest = 0
+    // cost[end] is the cheapest batching of the first `end` documents; its last batch starts
+    // at first[end].
+    var cost = [0] + [Int](repeating: .max, count: documents.count)
+    var first = [Int](repeating: 0, count: documents.count + 1)
+    for end in documents.indices.map({ $0 + 1 }) {
+        // Ascending order makes the last document the longest row of a batch that ends with it.
+        let width = documents[end - 1].input.tokenIds.count
+        for start in stride(from: end - 1, through: max(0, end - options.maxBatchSize), by: -1) {
+            let count = end - start
+            guard count == 1 || width * count <= options.maxBatchTokens else { break }
+            let blocks =
+                ((width - sharedTokens) * count + causalBatchBlockTokens - 1)
+                / causalBatchBlockTokens
+            let candidate =
+                cost[start] + causalBatchOverheadTokens + blocks * causalBatchBlockTokens
+            if candidate < cost[end] {
+                cost[end] = candidate
+                first[end] = start
+            }
         }
-        batch.append(document)
-        longest = max(longest, document.input.tokenIds.count)
     }
-    if !batch.isEmpty {
-        batches.append(batch)
+    var batches = [[EncodedCausalDocument]]()
+    var end = documents.count
+    while end > 0 {
+        batches.append(Array(documents[first[end] ..< end]))
+        end = first[end]
     }
-    return batches
+    return batches.reversed()
 }
 
 package func sortedByDescendingScore(_ results: [RerankResult]) -> [RerankResult] {

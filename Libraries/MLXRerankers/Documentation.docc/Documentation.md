@@ -108,6 +108,8 @@ prompts, or instructions without application-level evaluation.
 
 `RerankExecutionOptions` bounds batch size and token allocation. Pairwise inputs are sorted
 by encoded length, micro-batched under both limits, then restored to their original order.
+Causal rerankers group documents of similar length to limit padding, and run the prompt
+tokens that every pair of a request shares (the template, instruction, and query) once.
 `maxBatchTokens` is a hard forward-pass ceiling: it limits padded pairwise batches and the
 complete prompt of a listwise model.
 Choose `.error` truncation when silently shortening a candidate is not acceptable:
